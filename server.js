@@ -1,10 +1,17 @@
+require("dotenv").config();
+
 const http = require("node:http");
 const { MongoClient } = require("mongodb");
 const bcrypt = require("bcrypt");
 
-const PORT = 3000;
-const MONGO_URI = "mongodb://127.0.0.1:27017";
-const DB_NAME = "zeixon_cloud";
+const PORT = Number(process.env.PORT || 3000);
+const MONGO_URI = process.env.MONGO_URI;
+const DB_NAME = process.env.DB_NAME || "zeixon_cloud";
+
+if (!MONGO_URI) {
+  console.error("MONGO_URI belum diatur di file .env");
+  process.exit(1);
+}
 
 const client = new MongoClient(MONGO_URI);
 
