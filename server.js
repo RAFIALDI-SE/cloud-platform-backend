@@ -9,6 +9,8 @@ const DB_NAME = "zeixon_cloud";
 const client = new MongoClient(MONGO_URI);
 
 const allowedOrigins = new Set([
+  "https://zeixon.com",
+  "https://www.zeixon.com",
   "http://localhost:5500",
   "http://127.0.0.1:5500",
   "http://localhost:5501",
