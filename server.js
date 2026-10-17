@@ -74,6 +74,80 @@ function readJson(req) {
   });
 }
 
+async function verifyTurnstile(token, origin) {
+  const secret = process.env.TURNSTILE_SECRET_KEY;
+
+  if (!secret) {
+    return {
+      ok: false,
+      statusCode: 503,
+      message: "Verifikasi keamanan belum dikonfigurasi di server.",
+    };
+  }
+
+  if (typeof token !== "string" || !token.trim()) {
+    return {
+      ok: false,
+      statusCode: 400,
+      message: "Selesaikan verifikasi keamanan terlebih dahulu.",
+    };
+  }
+
+  try {
+    const response = await fetch(
+      "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          secret,
+          response: token,
+        }),
+        signal: AbortSignal.timeout(10000),
+      },
+    );
+
+    if (!response.ok) {
+      console.error("Verifikasi Turnstile gagal dihubungi:", response.status);
+      return {
+        ok: false,
+        statusCode: 502,
+        message: "Layanan verifikasi keamanan sedang bermasalah. Coba lagi.",
+      };
+    }
+
+    const result = await response.json();
+    const originHostname = new URL(origin).hostname;
+
+    if (
+      !result.success ||
+      typeof result.hostname !== "string" ||
+      result.hostname !== originHostname
+    ) {
+      console.warn(
+        "Token Turnstile ditolak:",
+        result["error-codes"] || "hostname atau token tidak valid",
+      );
+      return {
+        ok: false,
+        statusCode: 400,
+        message: "Verifikasi keamanan gagal atau kedaluwarsa. Coba lagi.",
+      };
+    }
+
+    return { ok: true };
+  } catch (error) {
+    console.error("Kesalahan saat memverifikasi Turnstile:", error.message);
+    return {
+      ok: false,
+      statusCode: 502,
+      message: "Tidak dapat menghubungi layanan verifikasi keamanan.",
+    };
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const origin = req.headers.origin;
 
@@ -111,27 +185,77 @@ const server = http.createServer(async (req, res) => {
 
   if (pathname === "/api/register" && req.method === "POST") {
     try {
+      if (!origin || !allowedOrigins.has(origin)) {
+        sendJson(res, 403, {
+          status: "error",
+          message: "Origin tidak diizinkan.",
+        });
+        return;
+      }
+
       const body = await readJson(req);
 
-      const name = typeof body.name === "string" ? body.name.trim() : "";
+      const firstName =
+        typeof body.firstName === "string" ? body.firstName.trim() : "";
+      const lastName =
+        typeof body.lastName === "string" ? body.lastName.trim() : "";
+      const name = `${firstName} ${lastName}`.trim();
 
       const email =
         typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
 
       const password = typeof body.password === "string" ? body.password : "";
+      const phone = typeof body.phone === "string" ? body.phone.trim() : "";
+      const companyName =
+        typeof body.companyName === "string" ? body.companyName.trim() : "";
+      const address1 =
+        typeof body.address1 === "string" ? body.address1.trim() : "";
+      const address2 =
+        typeof body.address2 === "string" ? body.address2.trim() : "";
+      const city = typeof body.city === "string" ? body.city.trim() : "";
+      const province =
+        typeof body.province === "string" ? body.province.trim() : "";
+      const postalCode =
+        typeof body.postalCode === "string" ? body.postalCode.trim() : "";
+      const country =
+        typeof body.country === "string" ? body.country.trim() : "Indonesia";
+      const currency =
+        typeof body.currency === "string" ? body.currency.trim() : "IDR";
+      const industry =
+        typeof body.industry === "string" ? body.industry.trim() : "";
+      const referralSource =
+        typeof body.referralSource === "string"
+          ? body.referralSource.trim()
+          : "";
 
-      if (!name || !email || !password) {
+      if (
+        !firstName ||
+        !lastName ||
+        !email ||
+        !password ||
+        !phone ||
+        !companyName ||
+        !address1 ||
+        !city ||
+        !province ||
+        !postalCode ||
+        !industry
+      ) {
         sendJson(res, 400, {
           status: "error",
-          message: "Nama, email, dan password wajib diisi.",
+          message: "Lengkapi semua field wajib pada formulir registrasi.",
         });
         return;
       }
 
-      if (name.length > 100) {
+      if (
+        firstName.length > 100 ||
+        lastName.length > 100 ||
+        name.length > 200
+      ) {
         sendJson(res, 400, {
           status: "error",
-          message: "Nama maksimal 100 karakter.",
+          message: "Nama depan dan belakang maksimal 100 karakter masing-masing.",
         });
         return;
       }
@@ -144,11 +268,84 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // Batas bcrypt: maksimal 72 byte untuk password UTF-8.
-      if (password.length < 8 || Buffer.byteLength(password, "utf8") > 72) {
+      if (password.length < 10 || Buffer.byteLength(password, "utf8") > 72) {
         sendJson(res, 400, {
           status: "error",
-          message: "Password minimal 8 karakter dan maksimal 72 byte.",
+          message: "Sandi minimal 10 karakter dan maksimal 72 byte.",
+        });
+        return;
+      }
+
+      const phoneDigits = phone.replace(/\D/g, "");
+      if (
+        phone.length > 32 ||
+        !/^\+?[0-9(). -]+$/.test(phone) ||
+        phoneDigits.length < 7 ||
+        phoneDigits.length > 15
+      ) {
+        sendJson(res, 400, {
+          status: "error",
+          message: "Format nomor telepon tidak valid.",
+        });
+        return;
+      }
+
+      const addressFields = [
+        [companyName, 150],
+        [address1, 250],
+        [address2, 250],
+        [city, 100],
+        [province, 100],
+        [postalCode, 20],
+      ];
+      if (addressFields.some(([value, maxLength]) => value.length > maxLength)) {
+        sendJson(res, 400, {
+          status: "error",
+          message: "Salah satu field alamat melebihi batas panjang.",
+        });
+        return;
+      }
+
+      const allowedCountries = new Set([
+        "Indonesia",
+        "Malaysia",
+        "Singapore",
+        "United States",
+        "United Kingdom",
+        "Other",
+      ]);
+      const allowedCurrencies = new Set(["IDR", "USD", "SGD", "MYR", "GBP"]);
+      const allowedIndustries = new Set([
+        "individual",
+        "technology",
+        "finance",
+        "retail",
+        "education",
+        "healthcare",
+        "manufacturing",
+        "media",
+        "government",
+        "other",
+      ]);
+      const allowedReferralSources = new Set([
+        "",
+        "search",
+        "social",
+        "referral",
+        "advertisement",
+        "event",
+        "other",
+      ]);
+
+      if (
+        !allowedCountries.has(country) ||
+        !allowedCurrencies.has(currency) ||
+        !allowedIndustries.has(industry) ||
+        !allowedReferralSources.has(referralSource)
+      ) {
+        sendJson(res, 400, {
+          status: "error",
+          message: "Pilihan negara, mata uang, sektor, atau sumber tidak valid.",
         });
         return;
       }
@@ -163,11 +360,38 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      const verification = await verifyTurnstile(
+        body.turnstileToken,
+        origin,
+      );
+      if (!verification.ok) {
+        sendJson(res, verification.statusCode, {
+          status: "error",
+          message: verification.message,
+        });
+        return;
+      }
+
       const passwordHash = await bcrypt.hash(password, 12);
 
       const result = await users.insertOne({
         name,
+        firstName,
+        lastName,
         email,
+        phone,
+        billingAddress: {
+          companyName,
+          address1,
+          address2: address2 || null,
+          city,
+          province,
+          postalCode,
+          country,
+        },
+        currency,
+        industry,
+        referralSource: referralSource || null,
         passwordHash,
         createdAt: new Date(),
       });
@@ -178,6 +402,8 @@ const server = http.createServer(async (req, res) => {
         user: {
           id: result.insertedId.toString(),
           name,
+          firstName,
+          lastName,
           email,
         },
       });
