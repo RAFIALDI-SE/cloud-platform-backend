@@ -1,6 +1,7 @@
 require("dotenv").config();
 
 const http = require("node:http");
+const crypto = require("node:crypto");
 const { MongoClient } = require("mongodb");
 const bcrypt = require("bcrypt");
 
@@ -14,6 +15,8 @@ if (!MONGO_URI) {
 }
 
 const client = new MongoClient(MONGO_URI);
+const SESSION_COOKIE_NAME = "zeixon_session";
+const SESSION_MAX_AGE_SECONDS = 7 * 24 * 60 * 60;
 
 const allowedOrigins = new Set([
   "https://zeixon.com",
@@ -27,6 +30,7 @@ const allowedOrigins = new Set([
 ]);
 
 let users;
+let sessions;
 
 function sendJson(res, statusCode, data) {
   res.writeHead(statusCode, {
@@ -34,6 +38,28 @@ function sendJson(res, statusCode, data) {
     "Cache-Control": "no-store",
   });
   res.end(JSON.stringify(data));
+}
+
+function getSessionToken(req) {
+  const cookieHeader = req.headers.cookie || "";
+  const sessionCookie = cookieHeader
+    .split(";")
+    .map((cookie) => cookie.trim())
+    .find((cookie) => cookie.startsWith(`${SESSION_COOKIE_NAME}=`));
+
+  return sessionCookie ? sessionCookie.slice(SESSION_COOKIE_NAME.length + 1) : "";
+}
+
+function hashSessionToken(token) {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+function setSessionCookie(req, res, token, maxAge) {
+  const secure = req.headers.origin?.startsWith("https://") ? "; Secure" : "";
+  res.setHeader(
+    "Set-Cookie",
+    `${SESSION_COOKIE_NAME}=${token}; HttpOnly; SameSite=Lax; Path=/api; Max-Age=${maxAge}${secure}`,
+  );
 }
 
 function readJson(req) {
@@ -156,6 +182,7 @@ const server = http.createServer(async (req, res) => {
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Access-Control-Allow-Credentials", "true");
   }
 
   if (req.method === "OPTIONS") {
@@ -180,6 +207,171 @@ const server = http.createServer(async (req, res) => {
       status: "ok",
       message: "ZeixonCloudHouse Backend is running",
     });
+    return;
+  }
+
+  if (pathname === "/api/session" && req.method === "GET") {
+    try {
+      if (origin && !allowedOrigins.has(origin)) {
+        sendJson(res, 403, {
+          status: "error",
+          message: "Origin tidak diizinkan.",
+        });
+        return;
+      }
+
+      const token = getSessionToken(req);
+      if (!token) {
+        sendJson(res, 200, { status: "success", authenticated: false });
+        return;
+      }
+
+      const session = await sessions.findOne({
+        tokenHash: hashSessionToken(token),
+        expiresAt: { $gt: new Date() },
+      });
+      if (!session) {
+        setSessionCookie(req, res, "", 0);
+        sendJson(res, 200, { status: "success", authenticated: false });
+        return;
+      }
+
+      const user = await users.findOne(
+        { _id: session.userId },
+        { projection: { firstName: 1, lastName: 1, email: 1 } },
+      );
+      if (!user) {
+        await sessions.deleteOne({ _id: session._id });
+        setSessionCookie(req, res, "", 0);
+        sendJson(res, 200, { status: "success", authenticated: false });
+        return;
+      }
+
+      sendJson(res, 200, {
+        status: "success",
+        authenticated: true,
+        user: {
+          id: user._id.toString(),
+          firstName: user.firstName,
+          lastName: user.lastName,
+          email: user.email,
+        },
+      });
+    } catch (error) {
+      console.error("Gagal memeriksa sesi pengguna:", error);
+      sendJson(res, 500, {
+        status: "error",
+        message: "Tidak dapat memeriksa sesi pengguna.",
+      });
+    }
+    return;
+  }
+
+  if (pathname === "/api/login" && req.method === "POST") {
+    try {
+      if (!origin || !allowedOrigins.has(origin)) {
+        sendJson(res, 403, {
+          status: "error",
+          message: "Origin tidak diizinkan.",
+        });
+        return;
+      }
+
+      const body = await readJson(req);
+      const email =
+        typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
+      const password = typeof body.password === "string" ? body.password : "";
+
+      if (
+        !email ||
+        email.length > 254 ||
+        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
+        !password ||
+        Buffer.byteLength(password, "utf8") > 72
+      ) {
+        sendJson(res, 400, {
+          status: "error",
+          message: "Masukkan email dan kata sandi yang valid.",
+        });
+        return;
+      }
+
+      const user = await users.findOne({ email });
+      const passwordMatches =
+        user &&
+        typeof user.passwordHash === "string" &&
+        (await bcrypt.compare(password, user.passwordHash));
+      if (!passwordMatches) {
+        sendJson(res, 401, {
+          status: "error",
+          message: "Email atau kata sandi salah.",
+        });
+        return;
+      }
+
+      const token = crypto.randomBytes(32).toString("hex");
+      const expiresAt = new Date(
+        Date.now() + SESSION_MAX_AGE_SECONDS * 1000,
+      );
+      await sessions.insertOne({
+        tokenHash: hashSessionToken(token),
+        userId: user._id,
+        createdAt: new Date(),
+        expiresAt,
+      });
+      setSessionCookie(req, res, token, SESSION_MAX_AGE_SECONDS);
+
+      sendJson(res, 200, {
+        status: "success",
+        authenticated: true,
+        user: {
+          id: user._id.toString(),
+          firstName: user.firstName,
+          lastName: user.lastName,
+          email: user.email,
+        },
+      });
+    } catch (error) {
+      if (error.statusCode) {
+        sendJson(res, error.statusCode, {
+          status: "error",
+          message: error.message,
+        });
+        return;
+      }
+
+      console.error("Kesalahan login:", error);
+      sendJson(res, 500, {
+        status: "error",
+        message: "Terjadi kesalahan pada server.",
+      });
+    }
+    return;
+  }
+
+  if (pathname === "/api/logout" && req.method === "POST") {
+    try {
+      if (!origin || !allowedOrigins.has(origin)) {
+        sendJson(res, 403, {
+          status: "error",
+          message: "Origin tidak diizinkan.",
+        });
+        return;
+      }
+
+      const token = getSessionToken(req);
+      if (token) {
+        await sessions.deleteOne({ tokenHash: hashSessionToken(token) });
+      }
+      setSessionCookie(req, res, "", 0);
+      sendJson(res, 200, { status: "success" });
+    } catch (error) {
+      console.error("Kesalahan logout:", error);
+      sendJson(res, 500, {
+        status: "error",
+        message: "Tidak dapat mengakhiri sesi. Coba lagi.",
+      });
+    }
     return;
   }
 
@@ -449,9 +641,12 @@ async function startServer() {
 
     const db = client.db(DB_NAME);
     users = db.collection("users");
+    sessions = db.collection("sessions");
 
     // Menjamin email unik meskipun ada request bersamaan.
     await users.createIndex({ email: 1 }, { unique: true });
+    await sessions.createIndex({ tokenHash: 1 }, { unique: true });
+    await sessions.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
     server.listen(PORT, "127.0.0.1", () => {
       console.log(`Backend berjalan di http://127.0.0.1:${PORT}`);
