@@ -238,7 +238,7 @@ const server = http.createServer(async (req, res) => {
 
       const user = await users.findOne(
         { _id: session.userId },
-        { projection: { firstName: 1, lastName: 1, email: 1 } },
+        { projection: { name: 1, firstName: 1, lastName: 1, email: 1, currency: 1 } },
       );
       if (!user) {
         await sessions.deleteOne({ _id: session._id });
@@ -252,9 +252,13 @@ const server = http.createServer(async (req, res) => {
         authenticated: true,
         user: {
           id: user._id.toString(),
+          name:
+            user.name ||
+            [user.firstName, user.lastName].filter(Boolean).join(" "),
           firstName: user.firstName,
           lastName: user.lastName,
           email: user.email,
+          currency: user.currency || "IDR",
         },
       });
     } catch (error) {
@@ -326,9 +330,13 @@ const server = http.createServer(async (req, res) => {
         authenticated: true,
         user: {
           id: user._id.toString(),
+          name:
+            user.name ||
+            [user.firstName, user.lastName].filter(Boolean).join(" "),
           firstName: user.firstName,
           lastName: user.lastName,
           email: user.email,
+          currency: user.currency || "IDR",
         },
       });
     } catch (error) {
